@@ -44,5 +44,4 @@ export const ICON_MAP: IconMap = {
   Email: 'lucide:mail',
   RSS: 'lucide:rss',
   Instagram: 'lucide:instagram',
-  TryHackMe: 'simple-icons:tryhackme',
 }
